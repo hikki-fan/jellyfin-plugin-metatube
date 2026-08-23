@@ -112,43 +112,7 @@ public static class SubtitleMatcher
             return false;
 
         var query = System.Web.HttpUtility.ParseQueryString(currentUri.Query);
-        var badge = query.Get("badge");
-        return !string.IsNullOrWhiteSpace(badge);
-    }
-
-    public static bool ShouldReconcilePrimaryImage(
-        string currentImagePath,
-        string expectedBadgedUrl,
-        string expectedUnbadgedUrl,
-        bool hasSubtitle,
-        bool enableBadges,
-        out string targetImageUrl)
-    {
-        targetImageUrl = null;
-
-        if (string.IsNullOrWhiteSpace(expectedBadgedUrl) || string.IsNullOrWhiteSpace(expectedUnbadgedUrl))
-            return false;
-
-        if (enableBadges && hasSubtitle)
-        {
-            if (!string.Equals(currentImagePath, expectedBadgedUrl, StringComparison.Ordinal))
-            {
-                targetImageUrl = expectedBadgedUrl;
-                return true;
-            }
-
-            return false;
-        }
-
-        // When subtitles are absent or badges disabled, remove the plugin badge only if
-        // it belongs to this exact MetaTube provider item. Never replace local or custom posters.
-        if (IsBadgedVersionOf(currentImagePath, expectedUnbadgedUrl))
-        {
-            targetImageUrl = expectedUnbadgedUrl;
-            return true;
-        }
-
-        return false;
+        return !string.IsNullOrWhiteSpace(query.Get("badge"));
     }
 
     private static bool TryCreateHttpUri(string value, out Uri uri)

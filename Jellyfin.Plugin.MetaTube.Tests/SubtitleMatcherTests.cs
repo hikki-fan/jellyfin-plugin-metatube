@@ -42,50 +42,14 @@ public sealed class SubtitleMatcherTests
         { "TITLE.mp4", new[] { "OTHER.chs.srt" }, false }
     };
 
-    [Fact]
-    public void ShouldReconcilePrimaryImage_AddsMissingBadge()
-    {
-        var changed = SubtitleMatcher.ShouldReconcilePrimaryImage(
-            "/media/poster.jpg", BadgedUrl, UnbadgedUrl, true, true, out var target);
-
-        Assert.True(changed);
-        Assert.Equal(BadgedUrl, target);
-    }
-
-    [Fact]
-    public void ShouldReconcilePrimaryImage_IsIdempotentAfterSuccess()
-    {
-        var changed = SubtitleMatcher.ShouldReconcilePrimaryImage(
-            BadgedUrl, BadgedUrl, UnbadgedUrl, true, true, out var target);
-
-        Assert.False(changed);
-        Assert.Null(target);
-    }
-
     [Theory]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    public void ShouldReconcilePrimaryImage_RemovesOwnedBadgeOnly(
-        bool hasSubtitle,
-        bool enableBadges)
+    [InlineData(BadgedUrl, true)]
+    [InlineData(UnbadgedUrl, false)]
+    [InlineData("https://example.com/v1/images/primary/JavDB/DE6Xa?badge=zimu.png", false)]
+    [InlineData("http://metatube:8080/v1/images/primary/JavDB/OTHER?badge=zimu.png", false)]
+    [InlineData("/media/poster.jpg", false)]
+    public void IsBadgedVersionOf_RequiresExactOwnedImage(string currentImage, bool expected)
     {
-        var changed = SubtitleMatcher.ShouldReconcilePrimaryImage(
-            BadgedUrl, BadgedUrl, UnbadgedUrl, hasSubtitle, enableBadges, out var target);
-
-        Assert.True(changed);
-        Assert.Equal(UnbadgedUrl, target);
-    }
-
-    [Theory]
-    [InlineData("/media/poster.jpg")]
-    [InlineData("https://example.com/v1/images/primary/JavDB/DE6Xa?badge=zimu.png")]
-    [InlineData("http://metatube:8080/v1/images/primary/JavDB/OTHER?badge=zimu.png")]
-    public void ShouldReconcilePrimaryImage_PreservesUnownedPoster(string currentImage)
-    {
-        var changed = SubtitleMatcher.ShouldReconcilePrimaryImage(
-            currentImage, BadgedUrl, UnbadgedUrl, false, true, out var target);
-
-        Assert.False(changed);
-        Assert.Null(target);
+        Assert.Equal(expected, SubtitleMatcher.IsBadgedVersionOf(currentImage, UnbadgedUrl));
     }
 }

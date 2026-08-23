@@ -78,89 +78,149 @@ public class OrganizeMetadataTask : IScheduledTask
 #endif
         }).ToList();
 
-        foreach (var (idx, item) in items.WithIndex())
+        var stateStore = new BadgeStateStore();
+        if (stateStore.LastLoadError != null)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            progress?.Report((double)idx / items.Count * 100);
+            _logger.Warn("Failed to load subtitle badge state store: {0}", stateStore.LastLoadError.Message);
+        }
 
-            var pid = item.GetPid(Plugin.ProviderId);
-            var hasSubtitle = SubtitleMatcher.HasChineseSubtitle(item);
-            var genres = item.Genres?.ToList() ?? new List<string>();
+        var validIds = new HashSet<string>(items.Select(i => i.Id.ToString()), StringComparer.OrdinalIgnoreCase);
+        stateStore.Prune(validIds);
 
-            // 1. Reconcile ChineseSubtitle genre independently (case-insensitive).
-            var hasChineseGenre = genres.Contains(SubtitleMatcher.ChineseSubtitle, StringComparer.OrdinalIgnoreCase);
-            if (hasSubtitle && !hasChineseGenre)
+        try
+        {
+            foreach (var (idx, item) in items.WithIndex())
             {
-                genres.Add(SubtitleMatcher.ChineseSubtitle);
-            }
-            else if (!hasSubtitle && hasChineseGenre)
-            {
-                genres.RemoveAll(s => s.Equals(SubtitleMatcher.ChineseSubtitle, StringComparison.OrdinalIgnoreCase));
-            }
+                cancellationToken.ThrowIfCancellationRequested();
+                progress?.Report((double)idx / items.Count * 100);
 
-            // 2. Reconcile primary image badge independently using image path as idempotency marker.
-            var imageChanged = false;
-            try
-            {
-                if (!string.IsNullOrWhiteSpace(pid.Provider) && !string.IsNullOrWhiteSpace(pid.Id))
+                var pid = item.GetPid(Plugin.ProviderId);
+                var hasSubtitle = SubtitleMatcher.HasChineseSubtitle(item);
+                var genres = item.Genres?.ToList() ?? new List<string>();
+
+                // 1. Reconcile ChineseSubtitle genre independently (case-insensitive).
+                var hasChineseGenre = genres.Contains(SubtitleMatcher.ChineseSubtitle, StringComparer.OrdinalIgnoreCase);
+                if (hasSubtitle && !hasChineseGenre)
                 {
-                    var badge = string.IsNullOrWhiteSpace(Plugin.Instance.Configuration.BadgeUrl)
-                        ? "zimu.png"
-                        : Plugin.Instance.Configuration.BadgeUrl;
-                    var expectedBadgedUrl = ApiClient.GetPrimaryImageApiUrl(
-                        pid.Provider, pid.Id, pid.Position ?? -1, badge);
-                    var expectedUnbadgedUrl = ApiClient.GetPrimaryImageApiUrl(
-                        pid.Provider, pid.Id, pid.Position ?? -1, string.Empty);
-                    var currentImagePath = item.GetImageInfo(ImageType.Primary, 0)?.Path;
+                    genres.Add(SubtitleMatcher.ChineseSubtitle);
+                }
+                else if (!hasSubtitle && hasChineseGenre)
+                {
+                    genres.RemoveAll(s => s.Equals(SubtitleMatcher.ChineseSubtitle, StringComparison.OrdinalIgnoreCase));
+                }
 
-                    if (SubtitleMatcher.ShouldReconcilePrimaryImage(
-                            currentImagePath,
-                            expectedBadgedUrl,
-                            expectedUnbadgedUrl,
-                            hasSubtitle,
-                            Plugin.Instance.Configuration.EnableBadges,
-                            out var targetImageUrl))
+                // 2. Reconcile primary image badge state machine.
+                var imageChanged = false;
+                var itemId = item.Id.ToString();
+                BadgeReconciliationResult badgeResult = null;
+
+                if (!string.IsNullOrWhiteSpace(pid.Id) && !string.IsNullOrWhiteSpace(pid.Provider))
+                {
+                    try
                     {
-                        SetPrimaryImage(item, targetImageUrl);
-                        imageChanged = true;
+                        var currentImagePath = item.GetImageInfo(ImageType.Primary, 0)?.Path;
+                        var existingState = stateStore.GetState(itemId);
+                        var badgesEnabled = Plugin.Instance.Configuration.EnableBadges;
+                        var currentHash = existingState != null || (badgesEnabled && hasSubtitle)
+                            ? BadgeStateMachine.ComputeFileHashSafely(currentImagePath)
+                            : null;
+                        var badge = string.IsNullOrWhiteSpace(Plugin.Instance.Configuration.BadgeUrl)
+                            ? "zimu.png"
+                            : Plugin.Instance.Configuration.BadgeUrl;
+
+                        var evalCtx = new BadgeReconciliationContext
+                        {
+                            ExpectedBadgedUrl = ApiClient.GetPrimaryImageApiUrl(
+                                pid.Provider, pid.Id, pid.Position ?? -1, badge),
+                            ExpectedUnbadgedUrl = ApiClient.GetPrimaryImageApiUrl(
+                                pid.Provider, pid.Id, pid.Position ?? -1, string.Empty),
+                            CurrentImagePath = currentImagePath,
+                            CurrentImageHash = currentHash,
+                            HasSubtitle = hasSubtitle,
+                            EnableBadges = badgesEnabled,
+                            ExistingState = existingState
+                        };
+
+                        badgeResult = BadgeStateMachine.Evaluate(evalCtx);
+
+                        switch (badgeResult.Action)
+                        {
+                            case BadgeAction.SetPrimaryImage:
+                                SetPrimaryImage(item, badgeResult.TargetImageUrl);
+                                imageChanged = true;
+                                break;
+
+                            case BadgeAction.UpdateStateOnly:
+                                ApplyStateTransition(stateStore, itemId, badgeResult);
+                                break;
+
+                            case BadgeAction.RemoveState:
+                                ApplyStateTransition(stateStore, itemId, badgeResult);
+                                break;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception e)
+                    {
+                        _logger.Error("Reconcile badge for video {0}: {1}", item.Name, e.Message);
                     }
                 }
+                else
+                {
+                    stateStore.RemoveState(itemId);
+                }
+
+                // 3. Reconcile Genres and ordering.
+                var orderedGenres =
+                    (Plugin.Instance.Configuration.EnableGenreSubstitution
+                        ? Plugin.Instance.Configuration.GetGenreSubstitutionTable().Substitute(genres)
+                        : genres).Distinct().OrderByString(genre => genre).ToList();
+
+                var genresChanged = !orderedGenres.SequenceEqual(
+                    item.Genres ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+                if (genresChanged)
+                {
+                    item.Genres = orderedGenres.ToArray();
+                }
+
+                // 4. Persist item if either image or genres changed.
+                if (!imageChanged && !genresChanged)
+                    continue;
+
+                _logger.Info("Organize metadata for video: {0}", item.Name);
+
+#if __EMBY__
+                _libraryManager.UpdateItem(item, item, ItemUpdateType.MetadataEdit, null);
+#else
+                await _libraryManager
+                    .UpdateItemAsync(item, item, ItemUpdateType.MetadataEdit, cancellationToken)
+                    .ConfigureAwait(false);
+#endif
+
+                // A SetImage plan becomes durable only after the item update succeeds.
+                // This prevents a failed metadata write from leaving a false Pending state.
+                if (imageChanged)
+                    ApplyStateTransition(stateStore, itemId, badgeResult);
             }
-            catch (OperationCanceledException)
+        }
+        finally
+        {
+            try
             {
-                throw;
+                stateStore.Save();
+                if (!string.IsNullOrWhiteSpace(stateStore.LastRecoveryBackupPath))
+                {
+                    _logger.Warn("Recovered subtitle badge state; unreadable input was preserved at {0}",
+                        stateStore.LastRecoveryBackupPath);
+                }
             }
             catch (Exception e)
             {
-                _logger.Error("Reconcile badge for video {0}: {1}", item.Name, e.Message);
+                _logger.Error("Failed to persist subtitle badge state: {0}", e.Message);
             }
-
-            // 3. Reconcile Genres and ordering.
-            var orderedGenres =
-                (Plugin.Instance.Configuration.EnableGenreSubstitution
-                    ? Plugin.Instance.Configuration.GetGenreSubstitutionTable().Substitute(genres)
-                    : genres).Distinct().OrderByString(genre => genre).ToList();
-
-            var genresChanged = !orderedGenres.SequenceEqual(
-                item.Genres ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
-            if (genresChanged)
-            {
-                item.Genres = orderedGenres.ToArray();
-            }
-
-            // 4. Persist item if either image or genres changed.
-            if (!imageChanged && !genresChanged)
-                continue;
-
-            _logger.Info("Organize metadata for video: {0}", item.Name);
-
-#if __EMBY__
-            _libraryManager.UpdateItem(item, item, ItemUpdateType.MetadataEdit, null);
-#else
-            await _libraryManager
-                .UpdateItemAsync(item, item, ItemUpdateType.MetadataEdit, cancellationToken)
-                .ConfigureAwait(false);
-#endif
         }
 
         progress?.Report(100);
@@ -175,6 +235,24 @@ public class OrganizeMetadataTask : IScheduledTask
             Path = imageUrl,
             Type = ImageType.Primary
         }, 0);
+    }
+
+    private static void ApplyStateTransition(
+        BadgeStateStore stateStore,
+        string itemId,
+        BadgeReconciliationResult result)
+    {
+        if (result == null)
+            return;
+
+        if (result.ShouldRemoveState || result.Action == BadgeAction.RemoveState)
+        {
+            stateStore.RemoveState(itemId);
+        }
+        else if (result.NewState != null)
+        {
+            stateStore.SetState(itemId, result.NewState);
+        }
     }
 
     #endregion
