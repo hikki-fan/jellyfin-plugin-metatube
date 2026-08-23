@@ -1,4 +1,5 @@
 using Jellyfin.Plugin.MetaTube.Extensions;
+using Jellyfin.Plugin.MetaTube.Helpers;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Providers;
@@ -35,6 +36,14 @@ public class MovieImageProvider : BaseProvider, IRemoteImageProvider, IHasOrder
         if (string.IsNullOrWhiteSpace(pid.Id) || string.IsNullOrWhiteSpace(pid.Provider))
             return Enumerable.Empty<RemoteImageInfo>();
 
+        var badge = Plugin.Instance.Configuration.EnableBadges &&
+                    (item.Genres?.Contains(SubtitleMatcher.ChineseSubtitle, StringComparer.OrdinalIgnoreCase) == true ||
+                     SubtitleMatcher.HasChineseSubtitle(item))
+            ? (string.IsNullOrWhiteSpace(Plugin.Instance.Configuration.BadgeUrl)
+                ? "zimu.png"
+                : Plugin.Instance.Configuration.BadgeUrl)
+            : default;
+
         var m = await ApiClient.GetMovieInfoAsync(pid.Provider, pid.Id, cancellationToken);
         var images = new List<RemoteImageInfo>
         {
@@ -42,7 +51,7 @@ public class MovieImageProvider : BaseProvider, IRemoteImageProvider, IHasOrder
             {
                 ProviderName = Name,
                 Type = ImageType.Primary,
-                Url = ApiClient.GetPrimaryImageApiUrl(m.Provider, m.Id, pid.Position ?? -1)
+                Url = ApiClient.GetPrimaryImageApiUrl(m.Provider, m.Id, pid.Position ?? -1, badge)
             },
             new()
             {
@@ -64,7 +73,8 @@ public class MovieImageProvider : BaseProvider, IRemoteImageProvider, IHasOrder
             {
                 ProviderName = Name,
                 Type = ImageType.Primary,
-                Url = ApiClient.GetPrimaryImageApiUrl(m.Provider, m.Id, imageUrl, pid.Position ?? -1)
+                Url = ApiClient.GetPrimaryImageApiUrl(
+                    m.Provider, m.Id, imageUrl, pid.Position ?? -1, badge: badge)
             });
 
             images.Add(new RemoteImageInfo

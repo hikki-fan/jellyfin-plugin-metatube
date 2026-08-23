@@ -205,9 +205,24 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         var searchResults = new List<MovieSearchResult>();
         if (string.IsNullOrWhiteSpace(pid.Id) || string.IsNullOrWhiteSpace(pid.Provider))
         {
+#if __EMBY__
+            // Emby may interpret a JAV number suffix as a production year. For example,
+            // GANA-1928 arrives here as Name=GANA and Year=1928. Try the restored number
+            // without fuzzy fallback first, then preserve the original search behavior.
+            if (TryRestoreJavNumber(info.Name, info.Year, out var restoredName))
+            {
+                Logger.Info("Try restored movie number: {0}", restoredName);
+                searchResults.AddRange(await ApiClient.SearchMovieAsync(
+                    restoredName, pid.Provider, false, cancellationToken));
+            }
+#endif
+
             // Search movie by name.
-            Logger.Info("Search for movie: {0}", info.Name);
-            searchResults.AddRange(await ApiClient.SearchMovieAsync(info.Name, pid.Provider, cancellationToken));
+            if (!searchResults.Any())
+            {
+                Logger.Info("Search for movie: {0}", info.Name);
+                searchResults.AddRange(await ApiClient.SearchMovieAsync(info.Name, pid.Provider, cancellationToken));
+            }
         }
         else
         {
@@ -234,6 +249,17 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
             }
         }
 
+        // Keep provider priority as the tie-breaker, but prefer an exact JAV number
+        // over fuzzy results from an earlier provider (MGMJ-007 vs MGMJ-070).
+        // The stable partition leaves the old order intact when nothing matches.
+        var exactMatchQuery = info.Name;
+#if __EMBY__
+        if (TryRestoreJavNumber(info.Name, info.Year, out var restoredExactMatchQuery))
+            exactMatchQuery = restoredExactMatchQuery;
+#endif
+        searchResults = JavNumberMatcher.ExactMatchesFirst(
+            searchResults, exactMatchQuery, result => result.Number);
+
         var results = new List<RemoteSearchResult>();
         if (!searchResults.Any())
         {
@@ -257,6 +283,24 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
 
         return results;
     }
+
+#if __EMBY__
+    private static bool TryRestoreJavNumber(string name, int? year, out string restoredName)
+    {
+        restoredName = string.Empty;
+        if (string.IsNullOrWhiteSpace(name) || year is < 1800 or > 2099)
+            return false;
+
+        // Only restore compact identifier-like names. Ordinary movie titles containing
+        // spaces or punctuation deliberately continue through the original search path.
+        if (!Regex.IsMatch(name, @"^[A-Za-z][A-Za-z0-9_]{1,15}$",
+                RegexOptions.CultureInvariant))
+            return false;
+
+        restoredName = $"{name}-{year.Value}";
+        return true;
+    }
+#endif
 
     private async Task SetActorImageUrl(PersonInfo actor, CancellationToken cancellationToken)
     {
