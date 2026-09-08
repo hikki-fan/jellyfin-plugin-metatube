@@ -51,10 +51,21 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         var pid = info.GetPid(Plugin.ProviderId);
         if (string.IsNullOrWhiteSpace(pid.Id) || string.IsNullOrWhiteSpace(pid.Provider))
         {
-            // Search movies and pick the first result.
-            var firstResult = (await GetSearchResults(info, cancellationToken)).FirstOrDefault();
-            if (firstResult != null) pid = firstResult.GetPid(Plugin.ProviderId);
+            var searchResults = await GetMovieSearchResults(info, cancellationToken);
+            var selectedResult = JavNumberMatcher.SelectMetadataResult(
+                info.Name, searchResults, r => r.Number);
+            if (selectedResult == null)
+            {
+                Logger.Info("No acceptable movie search result found for: {0}", info.Name);
+                return new MetadataResult<Movie>();
+            }
+
+            pid.Provider = selectedResult.Provider;
+            pid.Id = selectedResult.Id;
         }
+
+        if (string.IsNullOrWhiteSpace(pid.Id) || string.IsNullOrWhiteSpace(pid.Provider))
+            return new MetadataResult<Movie>();
 
         Logger.Info("Get movie info: {0}", pid.ToString());
 
@@ -201,6 +212,36 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         CancellationToken cancellationToken)
     {
         var pid = info.GetPid(Plugin.ProviderId);
+        var searchResults = await GetMovieSearchResults(info, cancellationToken);
+
+        var results = new List<RemoteSearchResult>();
+        if (!searchResults.Any())
+        {
+            Logger.Warn("Movie not found or has been filtered: {0}", pid.Id);
+            return results;
+        }
+
+        foreach (var m in searchResults)
+        {
+            var result = new RemoteSearchResult
+            {
+                Name = $"[{m.Provider}] {m.Number} {m.Title}",
+                SearchProviderName = Name,
+                PremiereDate = m.ReleaseDate.GetValidDateTime(),
+                ProductionYear = m.ReleaseDate.GetValidYear(),
+                ImageUrl = ApiClient.GetPrimaryImageApiUrl(m.Provider, m.Id, m.ThumbUrl, 1.0, true)
+            };
+            result.SetPid(Name, m.Provider, m.Id, pid.Position);
+            results.Add(result);
+        }
+
+        return results;
+    }
+
+    internal async Task<List<MovieSearchResult>> GetMovieSearchResults(MovieInfo info,
+        CancellationToken cancellationToken)
+    {
+        var pid = info.GetPid(Plugin.ProviderId);
 
         var searchResults = new List<MovieSearchResult>();
         if (string.IsNullOrWhiteSpace(pid.Id) || string.IsNullOrWhiteSpace(pid.Provider))
@@ -260,28 +301,7 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         searchResults = JavNumberMatcher.ExactMatchesFirst(
             searchResults, exactMatchQuery, result => result.Number);
 
-        var results = new List<RemoteSearchResult>();
-        if (!searchResults.Any())
-        {
-            Logger.Warn("Movie not found or has been filtered: {0}", pid.Id);
-            return results;
-        }
-
-        foreach (var m in searchResults)
-        {
-            var result = new RemoteSearchResult
-            {
-                Name = $"[{m.Provider}] {m.Number} {m.Title}",
-                SearchProviderName = Name,
-                PremiereDate = m.ReleaseDate.GetValidDateTime(),
-                ProductionYear = m.ReleaseDate.GetValidYear(),
-                ImageUrl = ApiClient.GetPrimaryImageApiUrl(m.Provider, m.Id, m.ThumbUrl, 1.0, true)
-            };
-            result.SetPid(Name, m.Provider, m.Id, pid.Position);
-            results.Add(result);
-        }
-
-        return results;
+        return searchResults;
     }
 
 #if __EMBY__
