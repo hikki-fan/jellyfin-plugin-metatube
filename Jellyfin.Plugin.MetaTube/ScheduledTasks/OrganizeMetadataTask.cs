@@ -84,8 +84,16 @@ public class OrganizeMetadataTask : IScheduledTask
             _logger.Warn("Failed to load subtitle badge state store: {0}", stateStore.LastLoadError.Message);
         }
 
+        var thumbStateStore = new BadgeStateStore(BadgeStateStore.DefaultThumbStateFilePath);
+        if (thumbStateStore.LastLoadError != null)
+        {
+            _logger.Warn("Failed to load thumbnail subtitle badge state store: {0}",
+                thumbStateStore.LastLoadError.Message);
+        }
+
         var validIds = new HashSet<string>(items.Select(i => i.Id.ToString()), StringComparer.OrdinalIgnoreCase);
         stateStore.Prune(validIds);
+        thumbStateStore.Prune(validIds);
 
         try
         {
@@ -111,8 +119,10 @@ public class OrganizeMetadataTask : IScheduledTask
 
                 // 2. Reconcile primary image badge state machine.
                 var imageChanged = false;
+                var thumbImageChanged = false;
                 var itemId = item.Id.ToString();
                 BadgeReconciliationResult badgeResult = null;
+                BadgeReconciliationResult thumbBadgeResult = null;
 
                 if (!string.IsNullOrWhiteSpace(pid.Id) && !string.IsNullOrWhiteSpace(pid.Provider))
                 {
@@ -167,10 +177,82 @@ public class OrganizeMetadataTask : IScheduledTask
                     {
                         _logger.Error("Reconcile badge for video {0}: {1}", item.Name, e.Message);
                     }
+
+                    try
+                    {
+                        var currentThumbPath = item.GetImageInfo(ImageType.Thumb, 0)?.Path;
+                        var existingThumbState = thumbStateStore.GetState(itemId);
+                        var badgesEnabled = Plugin.Instance.Configuration.EnableBadges;
+                        var currentThumbHash = existingThumbState != null || (badgesEnabled && hasSubtitle)
+                            ? BadgeStateMachine.ComputeFileHashSafely(currentThumbPath)
+                            : null;
+                        var badge = string.IsNullOrWhiteSpace(Plugin.Instance.Configuration.BadgeUrl)
+                            ? "zimu.png"
+                            : Plugin.Instance.Configuration.BadgeUrl;
+
+                        var thumbEvalCtx = new BadgeReconciliationContext
+                        {
+                            ExpectedBadgedUrl = ApiClient.GetThumbImageApiUrl(
+                                pid.Provider, pid.Id, badge: badge),
+                            ExpectedUnbadgedUrl = ApiClient.GetThumbImageApiUrl(
+                                pid.Provider, pid.Id, badge: string.Empty),
+                            CurrentImagePath = currentThumbPath,
+                            CurrentImageHash = currentThumbHash,
+                            HasSubtitle = hasSubtitle,
+                            EnableBadges = badgesEnabled,
+                            ExistingState = existingThumbState
+                        };
+
+                        thumbBadgeResult = BadgeStateMachine.Evaluate(thumbEvalCtx);
+
+                        switch (thumbBadgeResult.Action)
+                        {
+                            case BadgeAction.SetPrimaryImage:
+                                thumbImageChanged = await SetAndWarmThumbImageAsync(
+                                    item, thumbBadgeResult.TargetImageUrl, cancellationToken).ConfigureAwait(false);
+
+                                // ConvertImageToLocal completed the download before the metadata
+                                // write, so re-evaluate against the actual local file. This avoids
+                                // recording a thumbnail as applied merely because Emby/Jellyfin
+                                // still had an older landscape.jpg on disk.
+                                if (thumbImageChanged)
+                                {
+                                    var localizedThumbPath = item.GetImageInfo(ImageType.Thumb, 0)?.Path;
+                                    thumbBadgeResult = BadgeStateMachine.Evaluate(new BadgeReconciliationContext
+                                    {
+                                        ExpectedBadgedUrl = thumbEvalCtx.ExpectedBadgedUrl,
+                                        ExpectedUnbadgedUrl = thumbEvalCtx.ExpectedUnbadgedUrl,
+                                        CurrentImagePath = localizedThumbPath,
+                                        CurrentImageHash = BadgeStateMachine.ComputeFileHashSafely(localizedThumbPath),
+                                        HasSubtitle = hasSubtitle,
+                                        EnableBadges = badgesEnabled,
+                                        ExistingState = thumbBadgeResult.NewState
+                                    });
+                                }
+                                break;
+
+                            case BadgeAction.UpdateStateOnly:
+                                ApplyStateTransition(thumbStateStore, itemId, thumbBadgeResult);
+                                break;
+
+                            case BadgeAction.RemoveState:
+                                ApplyStateTransition(thumbStateStore, itemId, thumbBadgeResult);
+                                break;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception e)
+                    {
+                        _logger.Error("Reconcile thumbnail badge for video {0}: {1}", item.Name, e.Message);
+                    }
                 }
                 else
                 {
                     stateStore.RemoveState(itemId);
+                    thumbStateStore.RemoveState(itemId);
                 }
 
                 // 3. Reconcile Genres and ordering.
@@ -186,8 +268,8 @@ public class OrganizeMetadataTask : IScheduledTask
                     item.Genres = orderedGenres.ToArray();
                 }
 
-                // 4. Persist item if either image or genres changed.
-                if (!imageChanged && !genresChanged)
+                // 4. Persist item once if either image or genres changed.
+                if (!imageChanged && !thumbImageChanged && !genresChanged)
                     continue;
 
                 _logger.Info("Organize metadata for video: {0}", item.Name);
@@ -204,6 +286,9 @@ public class OrganizeMetadataTask : IScheduledTask
                 // This prevents a failed metadata write from leaving a false Pending state.
                 if (imageChanged)
                     ApplyStateTransition(stateStore, itemId, badgeResult);
+
+                if (thumbImageChanged)
+                    ApplyStateTransition(thumbStateStore, itemId, thumbBadgeResult);
             }
         }
         finally
@@ -221,6 +306,20 @@ public class OrganizeMetadataTask : IScheduledTask
             {
                 _logger.Error("Failed to persist subtitle badge state: {0}", e.Message);
             }
+
+            try
+            {
+                thumbStateStore.Save();
+                if (!string.IsNullOrWhiteSpace(thumbStateStore.LastRecoveryBackupPath))
+                {
+                    _logger.Warn("Recovered thumbnail subtitle badge state; unreadable input was preserved at {0}",
+                        thumbStateStore.LastRecoveryBackupPath);
+                }
+            }
+            catch (Exception e)
+            {
+                _logger.Error("Failed to persist thumbnail subtitle badge state: {0}", e.Message);
+            }
         }
 
         progress?.Report(100);
@@ -235,6 +334,42 @@ public class OrganizeMetadataTask : IScheduledTask
             Path = imageUrl,
             Type = ImageType.Primary
         }, 0);
+    }
+
+    /// <summary>
+    /// Downloads a remote thumbnail into the media server's normal image location before
+    /// persisting it. SetImage alone only records a URL and relies on a later UI request or
+    /// metadata refresh to fetch it; that made the scheduled task falsely complete early.
+    /// </summary>
+    private async Task<bool> SetAndWarmThumbImageAsync(
+        BaseItem item,
+        string imageUrl,
+        CancellationToken cancellationToken)
+    {
+        var remoteImage = new ItemImageInfo
+        {
+            Path = imageUrl,
+            Type = ImageType.Thumb
+        };
+
+#if __EMBY__
+        var localizedImage = await _libraryManager
+            .ConvertImageToLocal(item, remoteImage, 0, cancellationToken)
+            .ConfigureAwait(false);
+#else
+        var localizedImage = await _libraryManager
+            .ConvertImageToLocal(item, remoteImage, 0, removeOnFailure: false)
+            .ConfigureAwait(false);
+#endif
+
+        if (localizedImage == null || string.IsNullOrWhiteSpace(localizedImage.Path))
+        {
+            _logger.Warn("Unable to warm thumbnail image for video {0}", item.Name);
+            return false;
+        }
+
+        item.SetImage(localizedImage, 0);
+        return true;
     }
 
     private static void ApplyStateTransition(

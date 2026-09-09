@@ -38,14 +38,16 @@ public sealed class BadgeStateStore
 
     public static string DefaultStateFilePath
     {
-        get
-        {
-            var dataFolder = Plugin.Instance?.DataFolderPath;
-            if (string.IsNullOrWhiteSpace(dataFolder))
-                dataFolder = Path.Combine(AppContext.BaseDirectory, "data");
+        get => GetDefaultStateFilePath("subtitle-badge-state.json");
+    }
 
-            return Path.Combine(dataFolder, "subtitle-badge-state.json");
-        }
+    public static string DefaultThumbStateFilePath
+    {
+        // v1 could mark an existing local thumbnail as Applied without proving that
+        // Emby/Jellyfin had downloaded the requested remote badge image. Keep the
+        // old file for recovery/auditing and rebuild thumbnail state through the
+        // explicit localization path introduced in v2.
+        get => GetDefaultStateFilePath("subtitle-thumb-badge-state-v2.json");
     }
 
     public ItemBadgeState GetState(string itemId)
@@ -168,5 +170,14 @@ public sealed class BadgeStateStore
 
             _isDirty = false;
         }
+    }
+
+    private static string GetDefaultStateFilePath(string fileName)
+    {
+        var dataFolder = Plugin.Instance?.DataFolderPath;
+        if (string.IsNullOrWhiteSpace(dataFolder))
+            dataFolder = Path.Combine(AppContext.BaseDirectory, "data");
+
+        return Path.Combine(dataFolder, fileName);
     }
 }

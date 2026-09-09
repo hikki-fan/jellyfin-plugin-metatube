@@ -57,7 +57,7 @@ public class MovieImageProvider : BaseProvider, IRemoteImageProvider, IHasOrder
             {
                 ProviderName = Name,
                 Type = ImageType.Thumb,
-                Url = ApiClient.GetThumbImageApiUrl(m.Provider, m.Id)
+                Url = ApiClient.GetThumbImageApiUrl(m.Provider, m.Id, badge: badge)
             },
             new()
             {
@@ -81,7 +81,7 @@ public class MovieImageProvider : BaseProvider, IRemoteImageProvider, IHasOrder
             {
                 ProviderName = Name,
                 Type = ImageType.Thumb,
-                Url = ApiClient.GetThumbImageApiUrl(m.Provider, m.Id, imageUrl)
+                Url = ApiClient.GetThumbImageApiUrl(m.Provider, m.Id, imageUrl, badge: badge)
             });
 
             images.Add(new RemoteImageInfo

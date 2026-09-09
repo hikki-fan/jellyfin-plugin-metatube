@@ -97,10 +97,16 @@ public static class ApiClient
         return ComposeImageApiUrl(ThumbImageApi, provider, id);
     }
 
-    public static string GetThumbImageApiUrl(string provider, string id, string url, double position = -1,
-        bool auto = false)
+    public static string GetThumbImageApiUrl(string provider, string id, double position = -1,
+        string badge = default)
     {
-        return ComposeImageApiUrl(ThumbImageApi, provider, id, url, position: position, auto: auto);
+        return ComposeImageApiUrl(ThumbImageApi, provider, id, position: position, badge: badge);
+    }
+
+    public static string GetThumbImageApiUrl(string provider, string id, string url, double position = -1,
+        bool auto = false, string badge = default)
+    {
+        return ComposeImageApiUrl(ThumbImageApi, provider, id, url, position: position, auto: auto, badge: badge);
     }
 
     public static string GetBackdropImageApiUrl(string provider, string id)

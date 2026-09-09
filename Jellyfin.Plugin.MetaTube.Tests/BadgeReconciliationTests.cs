@@ -11,6 +11,12 @@ public sealed class BadgeReconciliationTests
     private const string BadgedUrl =
         "http://metatube:8080/v1/images/primary/JavDB/DE6Xa?ratio=-1&pos=-1&auto=False&badge=zimu.png&quality=90";
 
+    private const string ThumbUnbadgedUrl =
+        "http://metatube:8080/v1/images/thumb/JavDB/DE6Xa?ratio=-1&pos=-1&auto=False&quality=90";
+
+    private const string ThumbBadgedUrl =
+        "http://metatube:8080/v1/images/thumb/JavDB/DE6Xa?ratio=-1&pos=-1&auto=False&badge=zimu.png&quality=90";
+
     [Fact]
     public void ThreeRunLifecycle_BecomesIdempotentAfterLocalization()
     {
@@ -34,6 +40,52 @@ public sealed class BadgeReconciliationTests
 
         Assert.Equal(BadgeAction.None, third.Action);
         Assert.Null(third.NewState);
+    }
+
+    [Fact]
+    public void ThumbnailLifecycle_AppliesLocalizesAndRemovesOwnedBadge()
+    {
+        var first = BadgeStateMachine.Evaluate(new BadgeReconciliationContext
+        {
+            ExpectedBadgedUrl = ThumbBadgedUrl,
+            ExpectedUnbadgedUrl = ThumbUnbadgedUrl,
+            CurrentImagePath = "/metadata/thumb.jpg",
+            CurrentImageHash = "original-thumb",
+            HasSubtitle = true,
+            EnableBadges = true
+        });
+
+        Assert.Equal(BadgeAction.SetPrimaryImage, first.Action);
+        Assert.Equal(ThumbBadgedUrl, first.TargetImageUrl);
+
+        var localized = BadgeStateMachine.Evaluate(new BadgeReconciliationContext
+        {
+            ExpectedBadgedUrl = ThumbBadgedUrl,
+            ExpectedUnbadgedUrl = ThumbUnbadgedUrl,
+            CurrentImagePath = "/metadata/thumb.jpg",
+            CurrentImageHash = "badged-thumb",
+            HasSubtitle = true,
+            EnableBadges = true,
+            ExistingState = first.NewState
+        });
+
+        Assert.Equal(BadgeAction.UpdateStateOnly, localized.Action);
+        Assert.Equal(BadgeStateStatus.Applied, localized.NewState.Status);
+
+        var removed = BadgeStateMachine.Evaluate(new BadgeReconciliationContext
+        {
+            ExpectedBadgedUrl = ThumbBadgedUrl,
+            ExpectedUnbadgedUrl = ThumbUnbadgedUrl,
+            CurrentImagePath = "/metadata/thumb.jpg",
+            CurrentImageHash = "badged-thumb",
+            HasSubtitle = false,
+            EnableBadges = true,
+            ExistingState = localized.NewState
+        });
+
+        Assert.Equal(BadgeAction.SetPrimaryImage, removed.Action);
+        Assert.Equal(ThumbUnbadgedUrl, removed.TargetImageUrl);
+        Assert.True(removed.ShouldRemoveState);
     }
 
     [Fact]
@@ -188,6 +240,53 @@ public sealed class BadgeReconciliationTests
         {
             Directory.Delete(directory, recursive: true);
         }
+    }
+
+    [Fact]
+    public void PrimaryAndThumbnailStateStores_AreIndependent()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"metatube-badge-stores-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var primaryPath = Path.Combine(directory, "primary.json");
+        var thumbPath = Path.Combine(directory, "thumb.json");
+
+        try
+        {
+            var primaryStore = new BadgeStateStore(primaryPath);
+            var thumbStore = new BadgeStateStore(thumbPath);
+            primaryStore.SetState("item-1", AppliedState("primary-hash"));
+            thumbStore.SetState("item-1", new ItemBadgeState
+            {
+                ExpectedBadgedUrl = ThumbBadgedUrl,
+                AppliedLocalHash = "thumb-hash",
+                Status = BadgeStateStatus.Applied
+            });
+            primaryStore.Save();
+            thumbStore.Save();
+
+            var loadedPrimary = new BadgeStateStore(primaryPath).GetState("item-1");
+            var loadedThumb = new BadgeStateStore(thumbPath).GetState("item-1");
+
+            Assert.Equal(BadgedUrl, loadedPrimary.ExpectedBadgedUrl);
+            Assert.Equal("primary-hash", loadedPrimary.AppliedLocalHash);
+            Assert.Equal(ThumbBadgedUrl, loadedThumb.ExpectedBadgedUrl);
+            Assert.Equal("thumb-hash", loadedThumb.AppliedLocalHash);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ThumbnailStatePath_UsesV2StoreWithoutChangingPrimaryStore()
+    {
+        Assert.EndsWith("subtitle-badge-state.json", BadgeStateStore.DefaultStateFilePath,
+            StringComparison.Ordinal);
+        Assert.EndsWith("subtitle-thumb-badge-state-v2.json", BadgeStateStore.DefaultThumbStateFilePath,
+            StringComparison.Ordinal);
+        Assert.False(string.Equals(BadgeStateStore.DefaultStateFilePath, BadgeStateStore.DefaultThumbStateFilePath,
+            StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
